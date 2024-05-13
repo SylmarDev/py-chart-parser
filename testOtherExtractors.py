@@ -1,6 +1,6 @@
 # Copyright (C) Sylvia Rothove - 2023
 
-import PyPDF2
+import pymupdf as pymupdf
 import pyodbc
 import re
 import os
@@ -64,23 +64,28 @@ class Horse():
         else:
             suffix = "th"
 
-        return f"{self.name}: R{self.raceId}, {self.position}{suffix}"
+        return f"{self.name}: {self.position}{suffix}"
 
     def updateFromChart(self, chartLi, racePositionCount, totalFinishers):
-        self.lastRaced = chartLi[0]
+        self.lastRaced = chartLi[0].split(' ')[0]
         self.pgm = chartLi[1]
-        self.name = chartLi[2].split(' (')[0]
-        jockeyNameLi = chartLi[2].split('(')[1].replace(')', "").split(',')
-        self.jockey = f"{jockeyNameLi[1].replace(' ', '')} {jockeyNameLi[0]}"
-        self.weight = chartLi[3]
-        self.me = chartLi[4].replace(" ", "")
-        self.pp = chartLi[5]
-        self.comments = chartLi[-1:]
-        self.odds = chartLi[-2:-1]
-        self.racePositions = chartLi[5:-2] # will need cleaned up a smidge before uploading
+        self.name, self.jockey = parseNameAndJockey(chartLi[2])
 
+        ppIndex = 0
+        if isNumeric(chartLi[3]):
+            self.weight = chartLi[3]
+            self.me = chartLi[4].replace(" ", "")
+            ppIndex = 5
+        else:
+            self.weight = "".join(itertools.takewhile(lambda x: isNumeric(x), chartLi[3]))
+            self.me = chartLi[3][len(self.weight):].replace(" ", "")
+            ppIndex = 4
 
-    # hopefully unused now
+        self.pp = chartLi[ppIndex]
+        self.comments = chartLi[-1:][0]
+        self.odds = chartLi[-2:-1][0]
+        self.racePositions = chartLi[ppIndex+1:-2] # will need cleaned up a smidge before uploading
+
     def updateWithChartLine(self, chartLine, racePositionCount):
         self.racePositions = [[] * racePositionCount]
 
@@ -154,7 +159,23 @@ class Horse():
 
         return
 
-        
+
+def parseNameAndJockey(text):
+    jockeyNameIndex = text.rfind('(')
+
+    # Split the string into two parts
+    horseName = text[:jockeyNameIndex].strip()
+    jockeyName = text[jockeyNameIndex:].strip()
+
+    # Format Jockey Name
+    nameDivisorIndex = jockeyName.rfind(',')
+    jockeyName = f"{jockeyName[nameDivisorIndex:]} {jockeyName[:nameDivisorIndex]}"
+
+    # Remove lingering parens and commas
+    jockeyName = jockeyName.replace("(", "").replace(")", "").replace(",", "").strip()
+
+    return horseName, jockeyName
+
 def extractPgmNumber(text):
     # Define the regular expression pattern
     pattern = r'\b(\d+)(?=[A-Za-z]+\b)'
@@ -204,18 +225,17 @@ def parseRacePositionsOddsAndComments(input_string, finish_positions):
     return racePositions, odds, comments
 
 def extract_text_from_pdf(pdf_file: str) -> [str]:
-    with open(pdf_file, 'rb') as pdf:
-        reader = PyPDF2.PdfReader(pdf, strict=False)
+        reader = pymupdf.open(pdf_file, filetype="pdf")
         # no_pages = len(reader.pages)
         pdf_text = []
 
-        for page in reader.pages:
-            content = page.extract_text()
+        for page in reader:
+            content = page.get_text("text")
             pdf_text.append(content)
 
         return pdf_text
 
-
+ 
 def convertDateFormat(date_str):
     year = "20" + date_str[4:6]
     month = date_str[:2]
@@ -224,6 +244,9 @@ def convertDateFormat(date_str):
 
 def startsWith(string, prefix):
     i = 0
+    if len(string) < len(prefix):
+        return False
+
     while i < len(prefix):
         if (prefix[i] != string[i]):
             return False
@@ -234,6 +257,8 @@ def startsWith(string, prefix):
 
 def startsWithDate(string):
     numberOfStartNumbers = 0
+    if len(string) < 2:
+        return False
 
     # never started
     if startsWith(string, "---"):
@@ -305,6 +330,29 @@ def parseTrackAndDate(s):
 
     return track, date
 
+def getCallNo(lineLi, i):
+    startIndex = 0
+    findex = 0 # I'm so clever :)
+    while i < len(lineLi):
+        if startsWith(lineLi[i], "Start"):
+            startIndex = i
+        elif startsWith(lineLi[i], "Fin"):
+            findex = i
+
+        if startIndex != 0 and findex != 0:
+            break
+        i += 1
+
+    # plus 1 for including finish
+    return (findex - startIndex) + 1
+
+def getSplitTimes(inputString):
+    # pattern to match text within parentheses
+    pattern = re.compile(r'\((.*?)\)')
+    matches = pattern.findall(inputString)
+
+    return matches
+
 
 def __main__(path):
     print(f"Starting {track} // {date}")
@@ -336,25 +384,43 @@ def __main__(path):
                 readInSwitch = True
                 races.append(Race(raceNo, raceNo))
 
-                # sure hope this doesn't value error lol
-                # +1 for math. Should make it act inclusive
-                racePositionCount = lines[i].split(" ").index("Fin") - lines[i].split(" ").index("Start") + 1
+                #racePositionCount = getCallNo(lines, i) # get the number of calls in the race
 
                 i += 1
                 continue
             if readInSwitch:
+                # do all the horse lines at once
                 if startsWithDate(lines[i]):
-                    # print(lines[i])
-                    #lastRaced, horseName, jockeyName, weight, me, pp, racePositions, odds, comments = parseChartLine(lines[i])
-                    horse = Horse(raceNo, placement, False)
-                    horse.updateWithChartLine(lines[i], racePositionCount)
-                    #horses.append(Horse(raceNo, getHorseNameFromChartString(lines[i]), placement, False, get))
-                    placement += 1
+                    allHorseLines = list(itertools.takewhile(lambda x: not startsWith(x, "Fractional"), lines[i:]))
+                    # list of lists. each entry in this list is the list of values from the chart line
+                    horseChartLines = []
+                    for l in allHorseLines:
+                        if startsWithDate(l):
+                            horseChartLines.append([])
+                        horseChartLines[len(horseChartLines)-1].append(l)
+
+                    for l in horseChartLines:
+                        horse = Horse(raceNo, placement, False)
+                        horse.updateFromChart(l, racePositionCount, len(horseChartLines))
+                        horses.append(horse)
+                        placement += 1
+
+                    # update i to where it belongs
+                    i += len(allHorseLines)
                 if startsWith(lines[i], "Fractional"):
-                    races[len(races)-1].fractionalTimes = lines[i].split("Fractional Times:")[1].split("F")[0].strip()
+                    fractionalTimesLi = list(itertools.takewhile(lambda x: not startsWith(x, "Final"), lines[i:]))
+                    if startsWith(fractionalTimesLi[0], "Fractional"):
+                        fractionalTimesLi[0] = fractionalTimesLi[0].replace("Fractional Times: ", "")
+                    
+                    races[len(races)-1].fractionalTimes = fractionalTimesLi
+
+                    i += len(fractionalTimesLi)
                     races[len(races)-1].finalTime = lines[i].split("Final Time:")[1].strip()
+                    i += 1
                 if startsWith(lines[i], "Split"):
-                    races[len(races)-1].splitTimes = lines[i].split("Times:")[1].strip()
+                    splitTimesLi = list(itertools.takewhile(lambda x: not startsWith(x, "Run"), lines[i:]))
+                    races[len(races)-1].splitTimes = getSplitTimes(" ".join(splitTimesLi))
+                    i += len(splitTimesLi)
                 if startsWith(lines[i], "Scratch"):
                     allScratchString = lines[i]
                     ii = 1
@@ -367,7 +433,9 @@ def __main__(path):
                     sh = getScratchedHorsesFromString(allScratchString.split(":")[1])
                     # horse in scratched Horses
                     for h in sh:
-                        scratchedHorses.append(Horse(raceNo, h, "-1", True))
+                        scratchedHorse = Horse(raceNo, "-1", True)
+                        scratchedHorse.name = h
+                        scratchedHorses.append(scratchedHorse)
             if startsWith(lines[i], "Total"):
                 readInSwitch = False
                 placement = 1
@@ -380,7 +448,6 @@ def __main__(path):
 
     print("Loading races into database...")
     print("stopping short")
-    return
 
 
     horsesAlreadyUpdatedNames = []
@@ -389,12 +456,12 @@ def __main__(path):
         print(race.toString())
 
         for horse in horses:
-            if horse.raceId == race.raceId:
+            if horse.raceNumber == race.raceNo:
                 print("\t" + horse.toString())
 
         anyScratches = False
         for horse in scratchedHorses:
-            if horse.raceId == race.raceId:
+            if horse.raceNumber == race.raceNo:
                 if not anyScratches:
                     print("\nSCRATCHES:")
                     anyScratches = True
