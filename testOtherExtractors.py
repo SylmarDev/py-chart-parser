@@ -32,6 +32,20 @@ class Race():
     def toSqlInsert(self, raceId):
         return raceId, self.fractionalTimes, self.splitTimes, self.finalTime
 
+# passed a list of race positions that need broken up
+# needs to be up here because Horse class calls it iirc
+# racePositions [currentPosition, lengthsAhead]
+def parseRacePositions(li):
+    racePositions = []
+    for position in li:
+        if len(position) == 1:
+            racePositions.append([position, None])
+            continue
+        if "/" in position:
+            pass
+        # TODO: Cont from here
+
+
 class Horse():
     raceNumber = 0
     position = 0
