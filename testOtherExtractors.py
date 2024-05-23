@@ -5,6 +5,9 @@ import pyodbc
 import re
 import os
 import itertools
+import csv
+
+# TODO: remove redundant code
 
 # globals
 date = ""
@@ -14,6 +17,9 @@ paths = [] # strings of paths
 
 # assign directory
 directory = 'charts'
+csvDirectory = 'results'
+
+filesWritten = []
 
 class Race():
     raceId = 0
@@ -35,15 +41,72 @@ class Race():
 # passed a list of race positions that need broken up
 # needs to be up here because Horse class calls it iirc
 # racePositions [currentPosition, lengthsAhead]
-def parseRacePositions(li):
+# TODO: Long races (KENTUCKY DERBY) aren't parsed correctly
+def parseRacePositions(li, placement, totalFinishers):
     racePositions = []
+    racePos = ""
+    lengthsAhead = ""
+
     for position in li:
-        if len(position) == 1:
-            racePositions.append([position, None])
-            continue
-        if "/" in position:
-            pass
-        # TODO: Cont from here
+        try:
+            if len(position) == 1:
+                racePositions.append([position, ""])
+                continue
+
+            if "/" in position:
+                lengthsAhead = position[-3:]
+                racePos = position[:-3].strip()
+
+                if "0" in racePos or int(racePos) > totalFinishers:
+                    lengthsAhead = f"{racePos[-1:]} {lengthsAhead}"
+                    racePos = racePos[:-1]
+
+                racePositions.append([racePos, lengthsAhead])
+                continue
+
+            if "Head" in position or "Neck" in position or "Nose" in position:
+                racePositions.append([position[:-4], position[-4:]])
+                continue
+
+            if len(position) == 2:
+                # if last entry (final placement)
+                if position == li[len(li)-1]:
+                    racePos = str(placement)
+                    lengthsAhead = position.replace(racePos, "", 1)
+                    racePositions.append([racePos, lengthsAhead])
+                    continue
+
+                # will always be just placement in a 2 character entry
+                if "0" in position or int(position) == totalFinishers:
+                    racePositions.append([position, ""])
+                    continue
+
+                # split to first being racePos and second char being behind (default)
+                racePositions.append([position[:1], position[1:]])
+                continue
+
+            if len(position) == 3:
+                # look at prior racePos.
+                # Should always exist because the first will be there (its 1 or 2 long always)
+                previousRacePos = int(racePositions[len(racePositions)-1][0])
+                distFromOneChar = abs(int(position[:1]) - previousRacePos)
+                distFromTwoChar = abs(int(position[:2]) - previousRacePos)
+
+                if distFromOneChar > distFromTwoChar:
+                    racePositions.append([position[:2], position[2:]])
+                else: # distFromOneChar is less and catch default cases
+                    racePositions.append([position[:1], position[1:]])
+
+                continue
+
+            if len(position) == 4:
+                racePositions.append(position[:2], position[2:])
+                continue
+        except:
+            racePositions.append(["ERR", "ERR"])
+        # loop
+
+    return racePositions
 
 
 class Horse():
@@ -98,8 +161,32 @@ class Horse():
         self.pp = chartLi[ppIndex]
         self.comments = chartLi[-1:][0]
         self.odds = chartLi[-2:-1][0]
-        self.racePositions = chartLi[ppIndex+1:-2] # will need cleaned up a smidge before uploading
+        self.racePositions = parseRacePositions(chartLi[ppIndex+1:-2], self.position, totalFinishers) # will need cleaned up a smidge before uploading
 
+    # TODO: FIX THIS AS WELL!!!
+    def getCsvRow(self, finishedLast):
+        csvRow = [
+            self.lastRaced,
+            self.pgm,
+            self.name,
+            self.jockey,
+            self.weight,
+            self.me,
+            self.pp
+        ]
+
+        for racePosition in self.racePositions:
+            csvRow.extend(racePosition)
+        #csvRow.extend(self.racePositions)
+
+        csvRow.extend([
+            self.odds,
+            self.comments
+        ])
+
+        return [row for row in csvRow if row.strip() != ""] if not finishedLast else csvRow
+
+    # may all be obsolete, unsure though
     def updateWithChartLine(self, chartLine, racePositionCount):
         self.racePositions = [[] * racePositionCount]
 
@@ -168,9 +255,6 @@ class Horse():
 
         additionalRaceFinishes, self.odds, self.comments = parseRacePositionsOddsAndComments(chartLine, racePositionCount-1) # -1 because start done above
 
-
-
-
         return
 
 
@@ -227,7 +311,6 @@ def parseRacePositionsOddsAndComments(input_string, finish_positions):
         if char is "/":
             stopNext = True
 
-    # TODO: Cont from here
 
         
     
@@ -367,6 +450,11 @@ def getSplitTimes(inputString):
 
     return matches
 
+def getFileName(path):
+    name = os.path.basename(path)
+    extensionRemoved = os.path.splitext(name)[0]
+    return re.split(r'\.', extensionRemoved)[0]
+
 
 def __main__(path):
     print(f"Starting {track} // {date}")
@@ -374,6 +462,8 @@ def __main__(path):
     print("Reading PDF")
     extracted_text = extract_text_from_pdf(path)
     readInSwitch = False
+
+    csvFileName = getFileName(path)
 
     races = []
     horses = []
@@ -457,6 +547,8 @@ def __main__(path):
 
             i += 1
 
+    
+
     print("Read PDF successfully!")
     print(f"Preparing to load in {len(horses)} horses in {len(races)} races, as well as {len(scratchedHorses)} scratches to the database")
 
@@ -483,15 +575,62 @@ def __main__(path):
 
         print("\n")
 
+    print("Writing files to csv...")
+    # WRITE TO CSV
+    if not os.path.exists(csvDirectory):
+        os.makedirs(csvDirectory)
 
-    print("Finished")
+    with open(csvDirectory + "/" + csvFileName + ".csv", 'w+', newline='') as csvfile:
+        writer = csv.writer(csvfile, delimiter=',')
+        for race in races:
+            # TODO: PULL THESE FROM THE ACTUAL CHART WHAT ARE YOU DOING!!!
+            raceHorses = [horse for horse in horses if horse.raceNumber == race.raceNo]
+            raceInfoLine = [
+                "Last Raced",
+                "Pgm",
+                "Horse Name",
+                "Jockey",
+                "Wgt",
+                "M/E",
+                "PP",
+                "Start"
+            ]
+
+            # TODO: MAKE THIS SHOW WHAT IT SAYS LIKE LINE 583 SAYS !!!!
+            for i in range(1, len(raceHorses[0].racePositions)-2):
+                suffix = ""
+                if i == 1:
+                    suffix = "st"
+                elif i == 2:
+                    suffix = "nd"
+                elif i == 3:
+                    suffix = "rd"
+                else:
+                    suffix = "th"
+
+                raceInfoLine.extend([f"{i}{suffix} call", f"{i}{suffix} lengths ahead"])
+
+            raceInfoLine.extend(["Stretch", "Stretch lengths ahead", "Finish", "Finish Lengths ahead", "Odds", "Comments"])
+
+            writer.writerow(raceInfoLine)
+
+            for horse in raceHorses:
+                writer.writerow(horse.getCsvRow(horse.name == raceHorses[len(raceHorses)-1].name))
+
+            writer.writerow([""])
+            writer.writerow([""])
+
+    filesWritten.append(csvFileName)
+
+    print(f"Finished {csvFileName}!")
 
 for filename in os.listdir(directory):
     f = os.path.join(directory, filename)
     # checking if it is a file
-    if os.path.isfile(f):
+    if os.path.isfile(f) and f.endswith(".pdf"):
         paths.append(f)
 
 for path in paths:
     track, date = parseTrackAndDate(path)
     __main__(path)
+    #print("Finished! The following files were written:")
